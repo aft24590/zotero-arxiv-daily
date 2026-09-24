@@ -102,7 +102,7 @@ def test_retrieve_raw_papers_fallbacks_to_per_paper_on_batch_406(config, mock_fe
 
     monkeypatch.setattr(arxiv_retriever.arxiv, "Client", FakeClient)
     warnings: list[str] = []
-    monkeypatch.setattr(arxiv_retriever, "logger", SimpleNamespace(warning=warnings.append))
+    monkeypatch.setattr(arxiv_retriever, "logger", SimpleNamespace(warning=warnings.append, info=lambda _: None))
 
     retriever = ArxivRetriever(config)
     raw_papers = retriever._retrieve_raw_papers()
@@ -135,7 +135,7 @@ def test_retrieve_raw_papers_fallback_skips_failed_single_paper(config, mock_fee
 
     monkeypatch.setattr(arxiv_retriever.arxiv, "Client", FakeClient)
     warnings: list[str] = []
-    monkeypatch.setattr(arxiv_retriever, "logger", SimpleNamespace(warning=warnings.append))
+    monkeypatch.setattr(arxiv_retriever, "logger", SimpleNamespace(warning=warnings.append, info=lambda _: None))
 
     retriever = ArxivRetriever(config)
     raw_papers = retriever._retrieve_raw_papers()
@@ -194,7 +194,7 @@ def test_retrieve_batch_retries_429_without_fallback(config, monkeypatch):
     monkeypatch.setattr(arxiv_retriever.arxiv, "Client", FakeClient)
 
     retriever = ArxivRetriever(config)
-    batch = retriever._retrieve_batch_with_retries(
+    batch, status = retriever._retrieve_batch_with_retries(
         client=FakeClient(),
         batch_ids=paper_ids,
         batch_index=0,
@@ -203,8 +203,177 @@ def test_retrieve_batch_retries_429_without_fallback(config, monkeypatch):
     )
 
     assert batch is not None
+    assert status is None
     assert [paper.entry_id for paper in batch] == [f"https://arxiv.org/abs/{pid}" for pid in paper_ids]
     assert slept == [30, 60]
+
+
+def test_retrieve_raw_papers_opens_circuit_after_batch_and_probe_406(
+    config, mock_feedparser, monkeypatch
+):
+    monkeypatch.setattr(arxiv_retriever, "sleep", lambda _: None)
+    paper_ids = [f"2609.{i:05d}v1" for i in range(150)]
+    mock_feedparser.entries = [_make_feed_entry(pid) for pid in paper_ids]
+    call_id_lists: list[list[str]] = []
+    warnings: list[str] = []
+    infos: list[str] = []
+
+    class FakeClient:
+        def __init__(self, **kw):
+            assert kw["num_retries"] == 0
+            assert kw["delay_seconds"] >= 3
+
+        def results(self, search):
+            ids = list(search.id_list)
+            call_id_lists.append(ids)
+            raise arxiv_retriever.arxiv.HTTPError(
+                "https://export.arxiv.org/api/query", 0, 406
+            )
+
+    monkeypatch.setattr(arxiv_retriever.arxiv, "Client", FakeClient)
+    monkeypatch.setattr(
+        arxiv_retriever,
+        "logger",
+        SimpleNamespace(warning=warnings.append, info=infos.append),
+    )
+
+    retriever = ArxivRetriever(config)
+    raw_papers = retriever._retrieve_raw_papers()
+
+    assert raw_papers == []
+    assert len(call_id_lists) == 2
+    assert len(call_id_lists[0]) == 20
+    assert call_id_lists[1] == [paper_ids[0]]
+    assert any("Opening arXiv circuit" in msg for msg in warnings)
+    assert any("candidates=150" in msg and "circuit_open=True" in msg for msg in infos)
+
+
+def test_retrieve_raw_papers_opens_circuit_when_429_retries_exhausted(
+    config, mock_feedparser, monkeypatch
+):
+    slept: list[int] = []
+    monkeypatch.setattr(arxiv_retriever, "sleep", lambda seconds: slept.append(seconds))
+    paper_ids = [f"2609.{i:05d}v1" for i in range(40)]
+    mock_feedparser.entries = [_make_feed_entry(pid) for pid in paper_ids]
+    calls = 0
+
+    class FakeClient:
+        def __init__(self, **kw):
+            pass
+
+        def results(self, search):
+            nonlocal calls
+            calls += 1
+            raise arxiv_retriever.arxiv.HTTPError(
+                "https://export.arxiv.org/api/query", calls, 429
+            )
+
+    monkeypatch.setattr(arxiv_retriever.arxiv, "Client", FakeClient)
+
+    retriever = ArxivRetriever(config)
+    raw_papers = retriever._retrieve_raw_papers()
+
+    assert raw_papers == []
+    assert calls == arxiv_retriever.ARXIV_MAX_RETRIES
+    assert slept == [30, 60]
+
+
+def test_retrieve_raw_papers_discards_severely_degraded_results(
+    config, mock_feedparser, monkeypatch
+):
+    monkeypatch.setattr(arxiv_retriever, "sleep", lambda _: None)
+    paper_ids = [f"2609.{i:05d}v1" for i in range(150)]
+    mock_feedparser.entries = [_make_feed_entry(pid) for pid in paper_ids]
+    result_by_id = {pid: _make_fake_result(pid) for pid in paper_ids[:3]}
+    warnings: list[str] = []
+    infos: list[str] = []
+
+    class FakeClient:
+        def __init__(self, **kw):
+            pass
+
+        def results(self, search):
+            ids = list(search.id_list)
+            return iter([result_by_id[pid] for pid in ids if pid in result_by_id])
+
+    monkeypatch.setattr(arxiv_retriever.arxiv, "Client", FakeClient)
+    monkeypatch.setattr(
+        arxiv_retriever,
+        "logger",
+        SimpleNamespace(warning=warnings.append, info=infos.append),
+    )
+
+    retriever = ArxivRetriever(config)
+    raw_papers = retriever._retrieve_raw_papers()
+
+    assert raw_papers == []
+    assert any("retrieved 3/150 papers" in msg for msg in warnings)
+    assert any("success_rate=2.0%" in msg for msg in infos)
+
+
+def test_retrieve_raw_papers_keeps_healthy_partial_results(
+    config, mock_feedparser, monkeypatch
+):
+    monkeypatch.setattr(arxiv_retriever, "sleep", lambda _: None)
+    paper_ids = [f"2609.{i:05d}v1" for i in range(150)]
+    mock_feedparser.entries = [_make_feed_entry(pid) for pid in paper_ids]
+    missing = set(paper_ids[:5])
+    result_by_id = {
+        pid: _make_fake_result(pid)
+        for pid in paper_ids
+        if pid not in missing
+    }
+
+    class FakeClient:
+        def __init__(self, **kw):
+            pass
+
+        def results(self, search):
+            ids = list(search.id_list)
+            return iter([result_by_id[pid] for pid in ids if pid in result_by_id])
+
+    monkeypatch.setattr(arxiv_retriever.arxiv, "Client", FakeClient)
+
+    retriever = ArxivRetriever(config)
+    raw_papers = retriever._retrieve_raw_papers()
+
+    assert len(raw_papers) == 145
+    assert {paper.entry_id for paper in raw_papers} == {
+        f"https://arxiv.org/abs/{pid}" for pid in paper_ids if pid not in missing
+    }
+
+
+def test_retrieve_individual_nonretryable_error_skips_only_that_paper(
+    config, monkeypatch
+):
+    monkeypatch.setattr(arxiv_retriever, "sleep", lambda _: None)
+    paper_ids = ["2609.00001v1", "2609.00002v1", "2609.00003v1"]
+    failed_id = paper_ids[1]
+
+    class FakeClient:
+        def results(self, search):
+            pid = list(search.id_list)[0]
+            if pid == failed_id:
+                raise arxiv_retriever.arxiv.HTTPError(
+                    "https://export.arxiv.org/api/query", 0, 400
+                )
+            return iter([_make_fake_result(pid)])
+
+    retriever = ArxivRetriever(config)
+    outcome = retriever._retrieve_individual_papers(
+        client=FakeClient(),
+        paper_ids=paper_ids,
+        max_retries=3,
+        retry_delay=30,
+    )
+
+    assert outcome.circuit_status is None
+    assert outcome.requests == 3
+    assert outcome.failures == 1
+    assert [paper.entry_id for paper in outcome.papers] == [
+        f"https://arxiv.org/abs/{paper_ids[0]}",
+        f"https://arxiv.org/abs/{paper_ids[2]}",
+    ]
 
 
 def test_run_with_hard_timeout_returns_value():
