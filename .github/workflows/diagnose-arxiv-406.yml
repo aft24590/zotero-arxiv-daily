@@ -120,6 +120,66 @@ jobs:
           direct("known-success-minimal-new-ua", minimal_success, NEW_UA)
           PY
 
+      - name: Test exact historical 20-ID batch
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: |
+          python - <<'PY'
+          import time
+          import arxiv
+          import requests
+          from urllib.parse import urlencode
+
+          ids = [
+              "2609.22159v1","2609.22176v1","2609.22181v1","2609.22189v1","2609.22190v1",
+              "2609.22268v1","2609.22287v1","2609.22300v1","2609.22301v1","2609.22328v1",
+              "2609.22334v1","2609.22341v1","2609.22342v1","2609.22366v1","2609.22376v1",
+              "2609.22400v1","2609.22420v1","2609.22425v1","2609.22440v1","2609.22442v1",
+          ]
+
+          started = time.monotonic()
+          try:
+              client = arxiv.Client(page_size=100, delay_seconds=3.2, num_retries=0)
+              results = list(client.results(arxiv.Search(id_list=ids)))
+              print("=== arxiv-2.4.1-exact-historical-batch ===")
+              print("requested:", len(ids))
+              print("result_count:", len(results))
+              print("elapsed_seconds:", round(time.monotonic() - started, 3))
+          except Exception as exc:
+              print("=== arxiv-2.4.1-exact-historical-batch ===")
+              print("requested:", len(ids))
+              print("exception:", type(exc).__name__, repr(exc))
+              print("status:", getattr(exc, "status", None))
+              print("url:", getattr(exc, "url", None))
+              print("elapsed_seconds:", round(time.monotonic() - started, 3))
+
+          time.sleep(3.2)
+
+          params = {
+              "search_query": "",
+              "id_list": ",".join(ids),
+              "sortBy": "relevance",
+              "sortOrder": "descending",
+              "start": "0",
+              "max_results": "100",
+          }
+          started = time.monotonic()
+          resp = requests.get(
+              "https://export.arxiv.org/api/query?" + urlencode(params),
+              headers={"User-Agent": "arxiv.py/2.3.2"},
+              timeout=30,
+          )
+          print("=== direct-exact-historical-batch ===")
+          print("requested:", len(ids))
+          print("status:", resp.status_code)
+          print("elapsed_seconds:", round(time.monotonic() - started, 3))
+          print("content-type:", resp.headers.get("content-type"))
+          print("server:", resp.headers.get("server"))
+          print("via:", resp.headers.get("via"))
+          print("x-cache:", resp.headers.get("x-cache"))
+          print("body_prefix:", (resp.text or "").replace("\n", " ")[:300])
+          PY
+
       - name: Upgrade to arxiv 4.0.1
         run: |
           python -m pip install --quiet --upgrade "arxiv==4.0.1"
