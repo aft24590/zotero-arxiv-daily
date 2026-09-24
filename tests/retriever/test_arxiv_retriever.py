@@ -111,7 +111,7 @@ def test_retrieve_raw_papers_fallbacks_to_per_paper_on_batch_406(config, mock_fe
     assert set(p.entry_id for p in raw_papers) == {f"https://arxiv.org/abs/{pid}" for pid in paper_ids}
     assert call_id_lists[0] == paper_ids
     assert all(len(ids) == 1 for ids in call_id_lists[1:])
-    assert any("falling back to per-paper requests" in msg for msg in warnings)
+    assert any("probing a single paper before fallback" in msg for msg in warnings)
 
 
 def test_retrieve_raw_papers_fallback_skips_failed_single_paper(config, mock_feedparser, monkeypatch):
