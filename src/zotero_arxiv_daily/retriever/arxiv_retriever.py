@@ -136,25 +136,94 @@ class ArxivRetriever(BaseRetriever):
         max_batch_retries = 5
         batch_retry_delay = 30
         for i in range(0, len(all_paper_ids), 20):
-            search = arxiv.Search(id_list=all_paper_ids[i:i + 20])
-            for attempt in range(max_batch_retries):
-                try:
-                    batch = list(client.results(search))
-                    bar.update(len(batch))
-                    raw_papers.extend(batch)
-                    break
-                except arxiv.HTTPError as exc:
-                    if exc.status == 429 and attempt < max_batch_retries - 1:
-                        wait = batch_retry_delay * (attempt + 1)
-                        logger.warning(f"arXiv API 429 on batch {i // 20}, retry {attempt + 1}/{max_batch_retries} in {wait}s")
-                        sleep(wait)
-                    else:
-                        raise
+            batch_ids = all_paper_ids[i:i + 20]
+            batch = self._retrieve_batch_with_retries(
+                client=client,
+                batch_ids=batch_ids,
+                batch_index=i // 20,
+                max_retries=max_batch_retries,
+                retry_delay=batch_retry_delay,
+            )
+            if batch is not None:
+                raw_papers.extend(batch)
+            else:
+                raw_papers.extend(
+                    self._retrieve_individual_papers(
+                        client=client,
+                        paper_ids=batch_ids,
+                        max_retries=max_batch_retries,
+                        retry_delay=batch_retry_delay,
+                    )
+                )
+            bar.update(len(batch_ids))
             if i + 20 < len(all_paper_ids):
                 sleep(3)
         bar.close()
 
         return raw_papers
+
+    def _retrieve_batch_with_retries(
+        self,
+        *,
+        client: arxiv.Client,
+        batch_ids: list[str],
+        batch_index: int,
+        max_retries: int,
+        retry_delay: int,
+    ) -> list[ArxivResult] | None:
+        search = arxiv.Search(id_list=batch_ids)
+        for attempt in range(max_retries):
+            try:
+                return list(client.results(search))
+            except arxiv.HTTPError as exc:
+                status = getattr(exc, "status", None)
+                if status == 429 and attempt < max_retries - 1:
+                    wait = retry_delay * (attempt + 1)
+                    logger.warning(
+                        f"arXiv API 429 on batch {batch_index}, retry {attempt + 1}/{max_retries} in {wait}s"
+                    )
+                    sleep(wait)
+                    continue
+                logger.warning(
+                    f"arXiv batch request failed for batch {batch_index} with HTTP {status}; "
+                    "falling back to per-paper requests"
+                )
+                return None
+        return None
+
+    def _retrieve_individual_papers(
+        self,
+        *,
+        client: arxiv.Client,
+        paper_ids: list[str],
+        max_retries: int,
+        retry_delay: int,
+    ) -> list[ArxivResult]:
+        papers: list[ArxivResult] = []
+        for index, paper_id in enumerate(paper_ids):
+            search = arxiv.Search(id_list=[paper_id])
+            for attempt in range(max_retries):
+                try:
+                    results = list(client.results(search))
+                    if results:
+                        papers.append(results[0])
+                    else:
+                        logger.warning(f"No arXiv paper found for {paper_id}; skipping")
+                    break
+                except arxiv.HTTPError as exc:
+                    status = getattr(exc, "status", None)
+                    if status == 429 and attempt < max_retries - 1:
+                        wait = retry_delay * (attempt + 1)
+                        logger.warning(
+                            f"arXiv API 429 on paper {paper_id}, retry {attempt + 1}/{max_retries} in {wait}s"
+                        )
+                        sleep(wait)
+                        continue
+                    logger.warning(f"Skipping arXiv paper {paper_id} after API error: {exc}")
+                    break
+            if index < len(paper_ids) - 1:
+                sleep(1)
+        return papers
 
     def convert_to_paper(self, raw_paper: ArxivResult) -> Paper:
         title = raw_paper.title
