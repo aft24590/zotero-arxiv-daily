@@ -1,0 +1,157 @@
+name: Diagnose arXiv HTTP 406
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - diagnose/arxiv-406
+    paths:
+      - .github/workflows/diagnose-arxiv-406.yml
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install current locked client
+        run: |
+          python -m pip install --quiet "arxiv==2.4.1" requests
+
+      - name: Test arxiv 2.4.1 and direct request variants
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: |
+          python - <<'PY'
+          import time
+          import importlib.metadata
+          from urllib.parse import urlencode
+
+          import arxiv
+          import requests
+
+          FAILED_ID = "2609.26800v1"
+          SUCCESS_ID = "2609.28163v1"
+          OLD_UA = "arxiv.py/2.3.2"
+          NEW_UA = "zotero-arxiv-daily-diagnostic/1.0 (https://github.com/aft24590/zotero-arxiv-daily)"
+          BASE = "https://export.arxiv.org/api/query"
+
+          def safe_body(resp):
+              text = (resp.text or "").replace("\n", " ").replace("\r", " ")
+              return text[:300]
+
+          def direct(label, params, ua):
+              url = BASE + "?" + urlencode(params)
+              started = time.monotonic()
+              try:
+                  resp = requests.get(
+                      url,
+                      headers={
+                          "User-Agent": ua,
+                          "Accept": "application/atom+xml,application/xml;q=0.9,*/*;q=0.8",
+                      },
+                      timeout=30,
+                  )
+                  elapsed = time.monotonic() - started
+                  print(f"\n=== {label} ===")
+                  print("url:", resp.url)
+                  print("user-agent:", ua)
+                  print("status:", resp.status_code)
+                  print("elapsed_seconds:", round(elapsed, 3))
+                  print("content-type:", resp.headers.get("content-type"))
+                  print("server:", resp.headers.get("server"))
+                  print("via:", resp.headers.get("via"))
+                  print("x-cache:", resp.headers.get("x-cache"))
+                  print("body_prefix:", safe_body(resp))
+              except Exception as exc:
+                  elapsed = time.monotonic() - started
+                  print(f"\n=== {label} ===")
+                  print("url:", url)
+                  print("user-agent:", ua)
+                  print("exception:", type(exc).__name__, repr(exc))
+                  print("elapsed_seconds:", round(elapsed, 3))
+              time.sleep(3.2)
+
+          print("installed_arxiv_version:", importlib.metadata.version("arxiv"))
+          print("requests_version:", requests.__version__)
+
+          for pid, label in [(FAILED_ID, "known-failed"), (SUCCESS_ID, "known-success")]:
+              started = time.monotonic()
+              try:
+                  client = arxiv.Client(page_size=100, delay_seconds=3.2, num_retries=0)
+                  results = list(client.results(arxiv.Search(id_list=[pid])))
+                  print(f"\n=== arxiv-2.4.1-client-{label} ===")
+                  print("paper_id:", pid)
+                  print("result_count:", len(results))
+                  print("entry_ids:", [getattr(r, "entry_id", None) for r in results])
+              except Exception as exc:
+                  print(f"\n=== arxiv-2.4.1-client-{label} ===")
+                  print("paper_id:", pid)
+                  print("exception:", type(exc).__name__, repr(exc))
+                  print("status:", getattr(exc, "status", None))
+                  print("url:", getattr(exc, "url", None))
+              print("elapsed_seconds:", round(time.monotonic() - started, 3))
+              time.sleep(3.2)
+
+          full_failed = {
+              "search_query": "",
+              "id_list": FAILED_ID,
+              "sortBy": "relevance",
+              "sortOrder": "descending",
+              "start": "0",
+              "max_results": "100",
+          }
+          minimal_failed = {"id_list": FAILED_ID}
+          minimal_failed_nov = {"id_list": FAILED_ID.removesuffix("v1")}
+          minimal_success = {"id_list": SUCCESS_ID}
+
+          direct("full-params-old-ua", full_failed, OLD_UA)
+          direct("minimal-id-old-ua", minimal_failed, OLD_UA)
+          direct("full-params-new-ua", full_failed, NEW_UA)
+          direct("minimal-id-new-ua", minimal_failed, NEW_UA)
+          direct("minimal-no-version-new-ua", minimal_failed_nov, NEW_UA)
+          direct("known-success-minimal-new-ua", minimal_success, NEW_UA)
+          PY
+
+      - name: Upgrade to arxiv 4.0.1
+        run: |
+          python -m pip install --quiet --upgrade "arxiv==4.0.1"
+
+      - name: Test arxiv 4.0.1
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: |
+          python - <<'PY'
+          import time
+          import importlib.metadata
+          import arxiv
+
+          print("installed_arxiv_version:", importlib.metadata.version("arxiv"))
+          for pid, label in [
+              ("2609.26800v1", "known-failed"),
+              ("2609.28163v1", "known-success"),
+          ]:
+              started = time.monotonic()
+              try:
+                  client = arxiv.Client(page_size=100, delay_seconds=3.2, num_retries=0)
+                  results = list(client.results(arxiv.Search(id_list=[pid])))
+                  print(f"\n=== arxiv-4.0.1-client-{label} ===")
+                  print("paper_id:", pid)
+                  print("result_count:", len(results))
+                  print("entry_ids:", [getattr(r, "entry_id", None) for r in results])
+              except Exception as exc:
+                  print(f"\n=== arxiv-4.0.1-client-{label} ===")
+                  print("paper_id:", pid)
+                  print("exception:", type(exc).__name__, repr(exc))
+                  print("status:", getattr(exc, "status", None))
+                  print("url:", getattr(exc, "url", None))
+              print("elapsed_seconds:", round(time.monotonic() - started, 3))
+              time.sleep(3.2)
+          PY
