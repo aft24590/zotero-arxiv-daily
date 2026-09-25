@@ -30,7 +30,7 @@ RETRYABLE_ARXIV_STATUSES = {429, 500, 502, 503, 504}
 MIN_HEALTH_CHECK_CANDIDATES = 20
 MIN_RETRIEVAL_SUCCESS_RATE = 0.80
 RSS_SUMMARY_PREFIX_RE = re.compile(
-    r"^arXiv:\\S+\\s+Announce Type:\\s*\\S+\\s+Abstract:\\s*",
+    r"^arXiv:\S+\s+Announce Type:\s*\S+\s+Abstract:\s*",
     re.IGNORECASE | re.DOTALL,
 )
 
@@ -396,7 +396,7 @@ class ArxivRetriever(BaseRetriever):
                     f"No author metadata in arXiv RSS fallback entry {paper_id}"
                 )
 
-            base_id = re.sub(r"v\\d+$", "", paper_id)
+            base_id = re.sub(r"v\d+$", "", paper_id)
             papers.append(
                 RssArxivResult(
                     title=title,
