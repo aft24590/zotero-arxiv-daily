@@ -35,9 +35,8 @@ def _make_feed_entry(
     authors: str = "Test Author",
     summary: str | None = None,
 ) -> feedparser.FeedParserDict:
-    summary = summary or (
-        f"arXiv:{pid} Announce Type: new  Abstract: Abstract for {pid}"
-    )
+    if summary is None:
+        summary = f"arXiv:{pid} Announce Type: new  Abstract: Abstract for {pid}"
     base_id = pid.rsplit("v", 1)[0] if pid.rsplit("v", 1)[-1].isdigit() else pid
     return feedparser.FeedParserDict(
         id=f"oai:arXiv.org:{pid}",
