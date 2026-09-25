@@ -465,6 +465,61 @@ def test_rss_fallback_converts_to_paper_without_api_result(config, monkeypatch):
     assert paper.full_text == "full text"
 
 
+def test_rss_fallback_prefers_pdf_before_html(config, monkeypatch):
+    retriever = ArxivRetriever(config)
+    entry = _make_feed_entry("2609.12345v1")
+    raw = retriever._build_rss_fallback_papers([entry])[0]
+    calls: list[str] = []
+
+    monkeypatch.setattr(
+        arxiv_retriever,
+        "extract_text_from_tar",
+        lambda paper: calls.append("tar") or None,
+    )
+    monkeypatch.setattr(
+        arxiv_retriever,
+        "extract_text_from_pdf",
+        lambda paper: calls.append("pdf") or "pdf text",
+    )
+    monkeypatch.setattr(
+        arxiv_retriever,
+        "extract_text_from_html",
+        lambda paper: calls.append("html") or "html text",
+    )
+
+    paper = retriever.convert_to_paper(raw)
+
+    assert paper.full_text == "pdf text"
+    assert calls == ["tar", "pdf"]
+
+
+def test_api_result_keeps_html_before_pdf(config, monkeypatch):
+    retriever = ArxivRetriever(config)
+    raw = _make_fake_result("2609.12345v1")
+    calls: list[str] = []
+
+    monkeypatch.setattr(
+        arxiv_retriever,
+        "extract_text_from_tar",
+        lambda paper: calls.append("tar") or None,
+    )
+    monkeypatch.setattr(
+        arxiv_retriever,
+        "extract_text_from_html",
+        lambda paper: calls.append("html") or "html text",
+    )
+    monkeypatch.setattr(
+        arxiv_retriever,
+        "extract_text_from_pdf",
+        lambda paper: calls.append("pdf") or "pdf text",
+    )
+
+    paper = retriever.convert_to_paper(raw)
+
+    assert paper.full_text == "html text"
+    assert calls == ["tar", "html"]
+
+
 def test_run_with_hard_timeout_returns_value():
     result = _run_with_hard_timeout(
         _sleep_and_return, ("done", 0.01), timeout=1, operation="test op", paper_title="paper"
