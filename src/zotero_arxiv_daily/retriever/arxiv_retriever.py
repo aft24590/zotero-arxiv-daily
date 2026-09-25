@@ -8,6 +8,7 @@ import feedparser
 from tqdm import tqdm
 import multiprocessing
 import os
+import re
 from queue import Empty
 from dataclasses import dataclass
 from time import monotonic, sleep
@@ -28,6 +29,10 @@ ARXIV_RETRY_DELAY_SECONDS = 30
 RETRYABLE_ARXIV_STATUSES = {429, 500, 502, 503, 504}
 MIN_HEALTH_CHECK_CANDIDATES = 20
 MIN_RETRIEVAL_SUCCESS_RATE = 0.80
+RSS_SUMMARY_PREFIX_RE = re.compile(
+    r"^arXiv:\\S+\\s+Announce Type:\\s*\\S+\\s+Abstract:\\s*",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 @dataclass
@@ -48,6 +53,24 @@ class ArxivRetrievalStats:
         if self.candidates == 0:
             return 1.0
         return self.retrieved / self.candidates
+
+
+@dataclass
+class ArxivAuthorLike:
+    name: str
+
+
+@dataclass
+class RssArxivResult:
+    title: str
+    authors: list[ArxivAuthorLike]
+    summary: str
+    pdf_url: str
+    entry_id: str
+    _source_url: str
+
+    def source_url(self) -> str:
+        return self._source_url
 
 
 @dataclass
@@ -150,7 +173,7 @@ class ArxivRetriever(BaseRetriever):
         if self.config.source.arxiv.category is None:
             raise ValueError("category must be specified for arxiv.")
 
-    def _retrieve_raw_papers(self) -> list[ArxivResult]:
+    def _retrieve_raw_papers(self) -> list[ArxivResult | RssArxivResult]:
         started = monotonic()
         client = arxiv.Client(
             num_retries=0,
@@ -164,13 +187,18 @@ class ArxivRetriever(BaseRetriever):
             raise Exception(f"Invalid ARXIV_QUERY: {query}.")
 
         allowed_announce_types = {"new", "cross"} if include_cross_list else {"new"}
-        all_paper_ids = [
-            i.id.removeprefix("oai:arXiv.org:")
-            for i in feed.entries
-            if i.get("arxiv_announce_type", "new") in allowed_announce_types
+        selected_entries = [
+            entry
+            for entry in feed.entries
+            if entry.get("arxiv_announce_type", "new") in allowed_announce_types
         ]
         if self.config.executor.debug:
-            all_paper_ids = all_paper_ids[:10]
+            selected_entries = selected_entries[:10]
+
+        all_paper_ids = [
+            entry.id.removeprefix("oai:arXiv.org:")
+            for entry in selected_entries
+        ]
 
         stats = ArxivRetrievalStats(candidates=len(all_paper_ids))
         raw_papers: list[ArxivResult] = []
@@ -302,19 +330,85 @@ class ArxivRetriever(BaseRetriever):
             f"circuit_status={stats.circuit_status}, elapsed_seconds={stats.elapsed_seconds:.1f}"
         )
 
-        if (
+        api_degraded = (
             stats.candidates >= MIN_HEALTH_CHECK_CANDIDATES
             and stats.success_rate < MIN_RETRIEVAL_SUCCESS_RATE
-        ):
+        )
+        if stats.circuit_open or api_degraded:
             logger.warning(
-                "Discarding degraded arXiv retrieval result: "
+                "arXiv API retrieval is degraded; using RSS metadata fallback: "
                 f"retrieved {stats.retrieved}/{stats.candidates} papers "
-                f"({stats.success_rate:.1%}), below the "
-                f"{MIN_RETRIEVAL_SUCCESS_RATE:.0%} health threshold"
+                f"({stats.success_rate:.1%}), circuit_open={stats.circuit_open}, "
+                f"circuit_status={stats.circuit_status}"
             )
-            return []
+            rss_papers = self._build_rss_fallback_papers(selected_entries)
+            rss_success_rate = len(rss_papers) / max(1, stats.candidates)
+            logger.info(
+                "ArXiv RSS fallback summary: "
+                f"candidates={stats.candidates}, reconstructed={len(rss_papers)}, "
+                f"success_rate={rss_success_rate:.1%}"
+            )
+            if (
+                stats.candidates >= MIN_HEALTH_CHECK_CANDIDATES
+                and rss_success_rate < MIN_RETRIEVAL_SUCCESS_RATE
+            ):
+                logger.warning(
+                    "Discarding degraded arXiv RSS fallback result: "
+                    f"reconstructed {len(rss_papers)}/{stats.candidates} papers "
+                    f"({rss_success_rate:.1%}), below the "
+                    f"{MIN_RETRIEVAL_SUCCESS_RATE:.0%} health threshold"
+                )
+                return []
+            return rss_papers
 
         return raw_papers
+
+    def _build_rss_fallback_papers(
+        self,
+        entries: list[feedparser.FeedParserDict],
+    ) -> list[RssArxivResult]:
+        papers: list[RssArxivResult] = []
+        for entry in entries:
+            paper_id = entry.get("id", "").removeprefix("oai:arXiv.org:")
+            title = (entry.get("title") or "").strip()
+            summary = (entry.get("summary") or "").strip()
+            author_text = (entry.get("author") or "").strip()
+
+            if not paper_id or not title or not summary:
+                logger.warning(
+                    "Skipping incomplete arXiv RSS fallback entry: "
+                    f"id={paper_id or 'missing'}, title_present={bool(title)}, "
+                    f"summary_present={bool(summary)}"
+                )
+                continue
+
+            match = RSS_SUMMARY_PREFIX_RE.match(summary)
+            if match:
+                summary = summary[match.end():].strip()
+
+            authors = [
+                ArxivAuthorLike(name=name.strip())
+                for name in author_text.split(",")
+                if name.strip()
+            ]
+            if not authors:
+                logger.warning(
+                    f"No author metadata in arXiv RSS fallback entry {paper_id}"
+                )
+
+            base_id = re.sub(r"v\\d+$", "", paper_id)
+            papers.append(
+                RssArxivResult(
+                    title=title,
+                    authors=authors,
+                    summary=summary,
+                    pdf_url=f"https://arxiv.org/pdf/{base_id}",
+                    entry_id=f"https://arxiv.org/abs/{base_id}",
+                    _source_url=f"https://arxiv.org/e-print/{base_id}",
+                )
+            )
+
+        return papers
 
     def _retrieve_batch_with_retries(
         self,
@@ -431,7 +525,7 @@ class ArxivRetriever(BaseRetriever):
             failures=failures,
         )
 
-    def convert_to_paper(self, raw_paper: ArxivResult) -> Paper:
+    def convert_to_paper(self, raw_paper: ArxivResult | RssArxivResult) -> Paper:
         title = raw_paper.title
         authors = [a.name for a in raw_paper.authors]
         abstract = raw_paper.summary
@@ -452,7 +546,7 @@ class ArxivRetriever(BaseRetriever):
         )
 
 
-def extract_text_from_html(paper: ArxivResult) -> str | None:
+def extract_text_from_html(paper: ArxivResult | RssArxivResult) -> str | None:
     html_url = paper.entry_id.replace("/abs/", "/html/")
     try:
         return _extract_text_from_html_worker(html_url)
@@ -461,7 +555,7 @@ def extract_text_from_html(paper: ArxivResult) -> str | None:
         return None
 
 
-def extract_text_from_pdf(paper: ArxivResult) -> str | None:
+def extract_text_from_pdf(paper: ArxivResult | RssArxivResult) -> str | None:
     if paper.pdf_url is None:
         logger.warning(f"No PDF URL available for {paper.title}")
         return None
@@ -474,7 +568,7 @@ def extract_text_from_pdf(paper: ArxivResult) -> str | None:
     )
 
 
-def extract_text_from_tar(paper: ArxivResult) -> str | None:
+def extract_text_from_tar(paper: ArxivResult | RssArxivResult) -> str | None:
     source_url = paper.source_url()
     if source_url is None:
         logger.warning(f"No source URL available for {paper.title}")
