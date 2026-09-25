@@ -1,0 +1,81 @@
+name: Diagnose arXiv RSS author fidelity
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - diagnose/arxiv-406
+    paths:
+      - .github/workflows/diagnose-rss-authors.yml
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: python -m pip install --quiet requests feedparser beautifulsoup4
+
+      - name: Compare RSS authors with arXiv HTML meta
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: |
+          python - <<'PY'
+          import re
+          import requests
+          import feedparser
+          from bs4 import BeautifulSoup
+
+          CATEGORIES = [
+              "cond-mat.dis-nn","cond-mat.mes-hall","cond-mat.mtrl-sci",
+              "cond-mat.other","cond-mat.quant-gas","cond-mat.stat-mech",
+              "cond-mat.str-el","cond-mat.supr-con","quant-ph",
+          ]
+          UA = "zotero-arxiv-daily-rss-author-diagnostic/1.0 (+https://github.com/aft24590/zotero-arxiv-daily)"
+          session = requests.Session()
+          session.headers.update({"User-Agent": UA})
+
+          feed = feedparser.parse("https://rss.arxiv.org/atom/" + "+".join(CATEGORIES))
+          entries = [e for e in feed.entries if e.get("arxiv_announce_type", "new") == "new"]
+
+          comparisons = []
+          for e in entries[:20]:
+              pid = e.id.removeprefix("oai:arXiv.org:")
+              base = re.sub(r"v\d+$", "", pid)
+              rss_authors = [a.get("name") for a in (e.get("authors") or []) if a.get("name")]
+              resp = session.get(f"https://arxiv.org/abs/{base}", timeout=20)
+              soup = BeautifulSoup(resp.text, "html.parser")
+              html_authors = [
+                  tag.get("content")
+                  for tag in soup.find_all("meta", attrs={"name": "citation_author"})
+                  if tag.get("content")
+              ]
+              citation_title = soup.find("meta", attrs={"name": "citation_title"})
+              citation_abstract = soup.find("meta", attrs={"name": "citation_abstract"})
+              citation_pdf = soup.find("meta", attrs={"name": "citation_pdf_url"})
+              comparisons.append((pid, rss_authors, html_authors))
+              print("paper_id:", pid)
+              print("rss_author_count:", len(rss_authors))
+              print("html_author_count:", len(html_authors))
+              print("rss_authors:", rss_authors)
+              print("html_authors:", html_authors)
+              print("citation_title_present:", citation_title is not None)
+              print("citation_abstract_present:", citation_abstract is not None)
+              print("citation_pdf_present:", citation_pdf is not None)
+
+          print("\n=== AUTHOR FIDELITY SUMMARY ===")
+          print("sampled:", len(comparisons))
+          print("rss_single_author:", sum(len(r) == 1 for _, r, _ in comparisons))
+          print("html_multi_author:", sum(len(h) > 1 for _, _, h in comparisons))
+          print("exact_author_list_matches:", sum(r == h for _, r, h in comparisons))
+          print("rss_missing_coauthors:", sum(len(h) > len(r) for _, r, h in comparisons))
+          print("html_author_nonempty:", sum(bool(h) for _, _, h in comparisons))
+          PY
