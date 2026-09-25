@@ -1,0 +1,107 @@
+name: Diagnose RSS metadata fallback viability
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - diagnose/arxiv-406
+    paths:
+      - .github/workflows/diagnose-rss-fallback.yml
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: python -m pip install --quiet requests feedparser
+
+      - name: Validate RSS fallback fields and derived URLs
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: |
+          python - <<'PY'
+          import re
+          import requests
+          import feedparser
+
+          CATEGORIES = [
+              "cond-mat.dis-nn","cond-mat.mes-hall","cond-mat.mtrl-sci",
+              "cond-mat.other","cond-mat.quant-gas","cond-mat.stat-mech",
+              "cond-mat.str-el","cond-mat.supr-con","quant-ph",
+          ]
+          UA = "zotero-arxiv-daily-rss-fallback-diagnostic/1.0 (+https://github.com/aft24590/zotero-arxiv-daily)"
+          session = requests.Session()
+          session.headers.update({"User-Agent": UA})
+
+          query = "+".join(CATEGORIES)
+          feed = feedparser.parse(f"https://rss.arxiv.org/atom/{query}")
+          entries = [e for e in feed.entries if e.get("arxiv_announce_type", "new") == "new"]
+
+          prefix_re = re.compile(
+              r"^arXiv:(?P<id>\S+)\s+Announce Type:\s*\S+\s+Abstract:\s*",
+              re.IGNORECASE | re.DOTALL,
+          )
+
+          cleaned = []
+          prefix_matches = 0
+          nonempty_after_clean = 0
+          author_counts = []
+          link_matches = 0
+
+          for e in entries:
+              pid = e.id.removeprefix("oai:arXiv.org:")
+              summary = e.get("summary") or ""
+              m = prefix_re.match(summary)
+              if m:
+                  prefix_matches += 1
+                  abstract = summary[m.end():].strip()
+              else:
+                  abstract = summary.strip()
+              if abstract:
+                  nonempty_after_clean += 1
+              author_counts.append(len(e.get("authors") or []))
+              expected_abs = f"https://arxiv.org/abs/{re.sub(r'v\d+$', '', pid)}"
+              if any(link.get("href") == expected_abs for link in e.get("links", [])):
+                  link_matches += 1
+              cleaned.append((pid, abstract))
+
+          print("=== RSS PARSE VIABILITY ===")
+          print("entries:", len(entries))
+          print("prefix_matches:", prefix_matches)
+          print("prefix_match_rate:", f"{prefix_matches/max(1,len(entries)):.1%}")
+          print("nonempty_abstracts:", nonempty_after_clean)
+          print("nonempty_abstract_rate:", f"{nonempty_after_clean/max(1,len(entries)):.1%}")
+          print("entries_with_authors:", sum(x > 0 for x in author_counts))
+          print("max_author_count:", max(author_counts or [0]))
+          print("multi_author_entries:", sum(x > 1 for x in author_counts))
+          print("abs_link_matches:", link_matches)
+          print("abs_link_match_rate:", f"{link_matches/max(1,len(entries)):.1%}")
+
+          sample_ids = [pid for pid, _ in cleaned[:3]]
+          print("\n=== DERIVED URL ACCESS ===")
+          for pid in sample_ids:
+              base = re.sub(r"v\d+$", "", pid)
+              urls = {
+                  "abs": f"https://arxiv.org/abs/{base}",
+                  "pdf": f"https://arxiv.org/pdf/{base}",
+                  "eprint": f"https://arxiv.org/e-print/{base}",
+                  "html": f"https://arxiv.org/html/{base}",
+              }
+              print("paper_id:", pid)
+              for kind, url in urls.items():
+                  try:
+                      resp = session.get(url, stream=True, timeout=20, allow_redirects=True)
+                      print(kind, "status=", resp.status_code, "final_url=", resp.url, "content_type=", resp.headers.get("content-type"))
+                      resp.close()
+                  except Exception as exc:
+                      print(kind, "exception=", type(exc).__name__, repr(exc))
+          PY
