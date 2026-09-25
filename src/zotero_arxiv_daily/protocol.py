@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import ast
 from typing import Optional, TypeVar
 from datetime import datetime
 import re
@@ -7,6 +8,46 @@ from openai import OpenAI
 from loguru import logger
 import json
 RawPaperItem = TypeVar('RawPaperItem')
+
+
+def _parse_affiliations_response(response: str) -> list[str]:
+    match = re.search(r"\[.*?\]", response, flags=re.DOTALL)
+    if match is None:
+        raise ValueError("No list found in affiliation response")
+
+    candidate = match.group(0)
+    repaired_candidate = re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', candidate)
+
+    parsed = None
+    errors: list[Exception] = []
+    for parser, value in (
+        (json.loads, candidate),
+        (json.loads, repaired_candidate),
+        (ast.literal_eval, candidate),
+        (ast.literal_eval, repaired_candidate),
+    ):
+        try:
+            parsed = parser(value)
+            break
+        except (ValueError, SyntaxError, json.JSONDecodeError) as exc:
+            errors.append(exc)
+
+    if parsed is None:
+        raise ValueError(
+            "Could not parse affiliation list: "
+            + "; ".join(str(error) for error in errors[-2:])
+        )
+    if not isinstance(parsed, list):
+        raise ValueError("Affiliation response is not a list")
+
+    affiliations: list[str] = []
+    seen: set[str] = set()
+    for item in parsed:
+        value = str(item).strip()
+        if value and value not in seen:
+            affiliations.append(value)
+            seen.add(value)
+    return affiliations
 
 
 def _request_llm(openai_client: OpenAI, llm_params: dict, messages: list[dict]) -> str:
@@ -115,12 +156,7 @@ class Paper:
                 ],
             )
 
-            affiliations = re.search(r'\[.*?\]', affiliations, flags=re.DOTALL).group(0)
-            affiliations = json.loads(affiliations)
-            affiliations = list(set(affiliations))
-            affiliations = [str(a) for a in affiliations]
-
-            return affiliations
+            return _parse_affiliations_response(affiliations)
     
     def generate_affiliations(self, openai_client:OpenAI,llm_params:dict) -> Optional[list[str]]:
         try:
