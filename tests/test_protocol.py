@@ -142,6 +142,68 @@ def test_affiliations_malformed_llm_output(llm_params):
     assert result is None
 
 
+def _make_affiliation_client(content: str):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(
+                create=lambda **kw: SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            message=SimpleNamespace(content=content),
+                        )
+                    ]
+                )
+            )
+        )
+    )
+
+
+def test_affiliations_parses_code_fenced_json(llm_params):
+    paper = make_sample_paper()
+    client = _make_affiliation_client(
+        'Here is the result:\n\n```json\n["MIT", "Stanford University"]\n```'
+    )
+
+    result = paper.generate_affiliations(client, llm_params)
+
+    assert result == ["MIT", "Stanford University"]
+
+
+def test_affiliations_parses_python_single_quoted_list(llm_params):
+    paper = make_sample_paper()
+    client = _make_affiliation_client(
+        "['TsingHua University', 'Peking University']"
+    )
+
+    result = paper.generate_affiliations(client, llm_params)
+
+    assert result == ["TsingHua University", "Peking University"]
+
+
+def test_affiliations_repairs_invalid_backslash_escape(llm_params):
+    paper = make_sample_paper()
+    client = _make_affiliation_client(
+        '["Universit\\e de Montreal", "MIT"]'
+    )
+
+    result = paper.generate_affiliations(client, llm_params)
+
+    assert result == ["Universit\\e de Montreal", "MIT"]
+
+
+def test_affiliations_deduplicates_preserving_order(llm_params):
+    paper = make_sample_paper()
+    client = _make_affiliation_client(
+        '["MIT", "Stanford University", "MIT", "Caltech"]'
+    )
+
+    result = paper.generate_affiliations(client, llm_params)
+
+    assert result == ["MIT", "Stanford University", "Caltech"]
+
+
 def test_affiliations_error_returns_none(llm_params):
     from types import SimpleNamespace
 
