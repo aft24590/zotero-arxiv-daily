@@ -9,7 +9,8 @@ from tqdm import tqdm
 import multiprocessing
 import os
 from queue import Empty
-from time import sleep
+from dataclasses import dataclass
+from time import monotonic, sleep
 from typing import Any, Callable, TypeVar
 from loguru import logger
 import requests
@@ -19,6 +20,42 @@ T = TypeVar("T")
 DOWNLOAD_TIMEOUT = (10, 60)
 PDF_EXTRACT_TIMEOUT = 180
 TAR_EXTRACT_TIMEOUT = 180
+
+ARXIV_BATCH_SIZE = 20
+ARXIV_CLIENT_DELAY_SECONDS = 3
+ARXIV_MAX_RETRIES = 3
+ARXIV_RETRY_DELAY_SECONDS = 30
+RETRYABLE_ARXIV_STATUSES = {429, 500, 502, 503, 504}
+MIN_HEALTH_CHECK_CANDIDATES = 20
+MIN_RETRIEVAL_SUCCESS_RATE = 0.80
+
+
+@dataclass
+class ArxivRetrievalStats:
+    candidates: int = 0
+    retrieved: int = 0
+    batch_requests: int = 0
+    batch_failures: int = 0
+    fallback_requests: int = 0
+    fallback_failures: int = 0
+    circuit_open: bool = False
+    circuit_status: int | None = None
+    circuit_reason: str | None = None
+    elapsed_seconds: float = 0.0
+
+    @property
+    def success_rate(self) -> float:
+        if self.candidates == 0:
+            return 1.0
+        return self.retrieved / self.candidates
+
+
+@dataclass
+class IndividualRetrievalResult:
+    papers: list[ArxivResult]
+    requests: int
+    failures: int
+    circuit_status: int | None = None
 
 
 def _download_file(url: str, path: str) -> None:
@@ -114,14 +151,18 @@ class ArxivRetriever(BaseRetriever):
             raise ValueError("category must be specified for arxiv.")
 
     def _retrieve_raw_papers(self) -> list[ArxivResult]:
-        client = arxiv.Client(num_retries=10, delay_seconds=10)
+        started = monotonic()
+        client = arxiv.Client(
+            num_retries=0,
+            delay_seconds=ARXIV_CLIENT_DELAY_SECONDS,
+        )
         query = '+'.join(self.config.source.arxiv.category)
         include_cross_list = self.config.source.arxiv.get("include_cross_list", False)
-        # Get the latest paper from arxiv rss feed
+
         feed = feedparser.parse(f"https://rss.arxiv.org/atom/{query}")
         if 'Feed error for query' in feed.feed.title:
             raise Exception(f"Invalid ARXIV_QUERY: {query}.")
-        raw_papers = []
+
         allowed_announce_types = {"new", "cross"} if include_cross_list else {"new"}
         all_paper_ids = [
             i.id.removeprefix("oai:arXiv.org:")
@@ -131,34 +172,147 @@ class ArxivRetriever(BaseRetriever):
         if self.config.executor.debug:
             all_paper_ids = all_paper_ids[:10]
 
-        # Get full information of each paper from arxiv api
+        stats = ArxivRetrievalStats(candidates=len(all_paper_ids))
+        raw_papers: list[ArxivResult] = []
         bar = tqdm(total=len(all_paper_ids))
-        max_batch_retries = 5
-        batch_retry_delay = 30
-        for i in range(0, len(all_paper_ids), 20):
-            batch_ids = all_paper_ids[i:i + 20]
-            batch = self._retrieve_batch_with_retries(
+
+        for i in range(0, len(all_paper_ids), ARXIV_BATCH_SIZE):
+            batch_ids = all_paper_ids[i:i + ARXIV_BATCH_SIZE]
+            batch_index = i // ARXIV_BATCH_SIZE
+            stats.batch_requests += 1
+
+            batch, status = self._retrieve_batch_with_retries(
                 client=client,
                 batch_ids=batch_ids,
-                batch_index=i // 20,
-                max_retries=max_batch_retries,
-                retry_delay=batch_retry_delay,
+                batch_index=batch_index,
+                max_retries=ARXIV_MAX_RETRIES,
+                retry_delay=ARXIV_RETRY_DELAY_SECONDS,
             )
+
             if batch is not None:
                 raw_papers.extend(batch)
+                stats.retrieved += len(batch)
+                bar.update(len(batch_ids))
             else:
-                raw_papers.extend(
-                    self._retrieve_individual_papers(
-                        client=client,
-                        paper_ids=batch_ids,
-                        max_retries=max_batch_retries,
-                        retry_delay=batch_retry_delay,
+                stats.batch_failures += 1
+
+                if status in RETRYABLE_ARXIV_STATUSES:
+                    stats.circuit_open = True
+                    stats.circuit_status = status
+                    stats.circuit_reason = (
+                        f"batch {batch_index} exhausted retries with HTTP {status}"
                     )
+                    logger.warning(
+                        f"Opening arXiv circuit after batch {batch_index} exhausted retries "
+                        f"with HTTP {status}; remaining candidates will not be requested"
+                    )
+                    break
+
+                probe_id = batch_ids[0]
+                stats.fallback_requests += 1
+                probe, probe_status = self._retrieve_single_paper_once(
+                    client=client,
+                    paper_id=probe_id,
                 )
-            bar.update(len(batch_ids))
-            if i + 20 < len(all_paper_ids):
-                sleep(3)
+
+                if probe is not None:
+                    raw_papers.append(probe)
+                    stats.retrieved += 1
+
+                    fallback = self._retrieve_individual_papers(
+                        client=client,
+                        paper_ids=batch_ids[1:],
+                        max_retries=ARXIV_MAX_RETRIES,
+                        retry_delay=ARXIV_RETRY_DELAY_SECONDS,
+                    )
+                    raw_papers.extend(fallback.papers)
+                    stats.retrieved += len(fallback.papers)
+                    stats.fallback_requests += fallback.requests
+                    stats.fallback_failures += fallback.failures
+
+                    if fallback.circuit_status is not None:
+                        stats.circuit_open = True
+                        stats.circuit_status = fallback.circuit_status
+                        stats.circuit_reason = (
+                            f"individual fallback exhausted retries with HTTP "
+                            f"{fallback.circuit_status}"
+                        )
+                        logger.warning(
+                            f"Opening arXiv circuit after individual fallback exhausted retries "
+                            f"with HTTP {fallback.circuit_status}; remaining candidates will not "
+                            "be requested"
+                        )
+
+                    bar.update(len(batch_ids))
+                    if stats.circuit_open:
+                        break
+                else:
+                    stats.fallback_failures += 1
+                    if probe_status == status or probe_status in RETRYABLE_ARXIV_STATUSES:
+                        stats.circuit_open = True
+                        stats.circuit_status = probe_status
+                        stats.circuit_reason = (
+                            f"batch {batch_index} failed with HTTP {status} and single-paper "
+                            f"probe failed with HTTP {probe_status}"
+                        )
+                        logger.warning(
+                            f"Opening arXiv circuit: batch {batch_index} failed with HTTP {status} "
+                            f"and probe {probe_id} failed with HTTP {probe_status}; remaining "
+                            "candidates will not be requested"
+                        )
+                        break
+
+                    fallback = self._retrieve_individual_papers(
+                        client=client,
+                        paper_ids=batch_ids[1:],
+                        max_retries=ARXIV_MAX_RETRIES,
+                        retry_delay=ARXIV_RETRY_DELAY_SECONDS,
+                    )
+                    raw_papers.extend(fallback.papers)
+                    stats.retrieved += len(fallback.papers)
+                    stats.fallback_requests += fallback.requests
+                    stats.fallback_failures += fallback.failures
+                    bar.update(len(batch_ids))
+
+                    if fallback.circuit_status is not None:
+                        stats.circuit_open = True
+                        stats.circuit_status = fallback.circuit_status
+                        stats.circuit_reason = (
+                            f"individual fallback exhausted retries with HTTP "
+                            f"{fallback.circuit_status}"
+                        )
+                        logger.warning(
+                            f"Opening arXiv circuit after individual fallback exhausted retries "
+                            f"with HTTP {fallback.circuit_status}; remaining candidates will not "
+                            "be requested"
+                        )
+                        break
+
+            if i + ARXIV_BATCH_SIZE < len(all_paper_ids):
+                sleep(ARXIV_CLIENT_DELAY_SECONDS)
+
         bar.close()
+        stats.elapsed_seconds = monotonic() - started
+        logger.info(
+            "ArXiv retrieval summary: "
+            f"candidates={stats.candidates}, retrieved={stats.retrieved}, "
+            f"success_rate={stats.success_rate:.1%}, batch_requests={stats.batch_requests}, "
+            f"batch_failures={stats.batch_failures}, fallback_requests={stats.fallback_requests}, "
+            f"fallback_failures={stats.fallback_failures}, circuit_open={stats.circuit_open}, "
+            f"circuit_status={stats.circuit_status}, elapsed_seconds={stats.elapsed_seconds:.1f}"
+        )
+
+        if (
+            stats.candidates >= MIN_HEALTH_CHECK_CANDIDATES
+            and stats.success_rate < MIN_RETRIEVAL_SUCCESS_RATE
+        ):
+            logger.warning(
+                "Discarding degraded arXiv retrieval result: "
+                f"retrieved {stats.retrieved}/{stats.candidates} papers "
+                f"({stats.success_rate:.1%}), below the "
+                f"{MIN_RETRIEVAL_SUCCESS_RATE:.0%} health threshold"
+            )
+            return []
 
         return raw_papers
 
@@ -170,26 +324,51 @@ class ArxivRetriever(BaseRetriever):
         batch_index: int,
         max_retries: int,
         retry_delay: int,
-    ) -> list[ArxivResult] | None:
+    ) -> tuple[list[ArxivResult] | None, int | None]:
         search = arxiv.Search(id_list=batch_ids)
         for attempt in range(max_retries):
             try:
-                return list(client.results(search))
+                return list(client.results(search)), None
             except arxiv.HTTPError as exc:
                 status = getattr(exc, "status", None)
-                if status == 429 and attempt < max_retries - 1:
+                if status in RETRYABLE_ARXIV_STATUSES and attempt < max_retries - 1:
                     wait = retry_delay * (attempt + 1)
                     logger.warning(
-                        f"arXiv API 429 on batch {batch_index}, retry {attempt + 1}/{max_retries} in {wait}s"
+                        f"arXiv API {status} on batch {batch_index}, "
+                        f"retry {attempt + 1}/{max_retries} in {wait}s"
                     )
                     sleep(wait)
                     continue
-                logger.warning(
-                    f"arXiv batch request failed for batch {batch_index} with HTTP {status}; "
-                    "falling back to per-paper requests"
-                )
-                return None
-        return None
+
+                if status in RETRYABLE_ARXIV_STATUSES:
+                    logger.warning(
+                        f"arXiv batch {batch_index} exhausted {max_retries} attempts "
+                        f"with HTTP {status}"
+                    )
+                else:
+                    logger.warning(
+                        f"arXiv batch request failed for batch {batch_index} with HTTP {status}; "
+                        "probing a single paper before fallback"
+                    )
+                return None, status
+
+        return None, None
+
+    def _retrieve_single_paper_once(
+        self,
+        *,
+        client: arxiv.Client,
+        paper_id: str,
+    ) -> tuple[ArxivResult | None, int | None]:
+        try:
+            results = list(client.results(arxiv.Search(id_list=[paper_id])))
+        except arxiv.HTTPError as exc:
+            return None, getattr(exc, "status", None)
+
+        if not results:
+            logger.warning(f"No arXiv paper found for {paper_id}; skipping")
+            return None, None
+        return results[0], None
 
     def _retrieve_individual_papers(
         self,
@@ -198,32 +377,59 @@ class ArxivRetriever(BaseRetriever):
         paper_ids: list[str],
         max_retries: int,
         retry_delay: int,
-    ) -> list[ArxivResult]:
+    ) -> IndividualRetrievalResult:
         papers: list[ArxivResult] = []
+        requests = 0
+        failures = 0
+
         for index, paper_id in enumerate(paper_ids):
+            requests += 1
             search = arxiv.Search(id_list=[paper_id])
+
             for attempt in range(max_retries):
                 try:
                     results = list(client.results(search))
                     if results:
                         papers.append(results[0])
                     else:
+                        failures += 1
                         logger.warning(f"No arXiv paper found for {paper_id}; skipping")
                     break
                 except arxiv.HTTPError as exc:
                     status = getattr(exc, "status", None)
-                    if status == 429 and attempt < max_retries - 1:
+                    if status in RETRYABLE_ARXIV_STATUSES and attempt < max_retries - 1:
                         wait = retry_delay * (attempt + 1)
                         logger.warning(
-                            f"arXiv API 429 on paper {paper_id}, retry {attempt + 1}/{max_retries} in {wait}s"
+                            f"arXiv API {status} on paper {paper_id}, "
+                            f"retry {attempt + 1}/{max_retries} in {wait}s"
                         )
                         sleep(wait)
                         continue
+
+                    failures += 1
+                    if status in RETRYABLE_ARXIV_STATUSES:
+                        logger.warning(
+                            f"arXiv paper {paper_id} exhausted {max_retries} attempts "
+                            f"with HTTP {status}"
+                        )
+                        return IndividualRetrievalResult(
+                            papers=papers,
+                            requests=requests,
+                            failures=failures,
+                            circuit_status=status,
+                        )
+
                     logger.warning(f"Skipping arXiv paper {paper_id} after API error: {exc}")
                     break
+
             if index < len(paper_ids) - 1:
                 sleep(1)
-        return papers
+
+        return IndividualRetrievalResult(
+            papers=papers,
+            requests=requests,
+            failures=failures,
+        )
 
     def convert_to_paper(self, raw_paper: ArxivResult) -> Paper:
         title = raw_paper.title
