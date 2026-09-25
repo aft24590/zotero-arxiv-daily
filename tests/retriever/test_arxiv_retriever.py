@@ -29,10 +29,29 @@ def _make_fake_result(pid: str) -> SimpleNamespace:
     )
 
 
-def _make_feed_entry(pid: str) -> feedparser.FeedParserDict:
+def _make_feed_entry(
+    pid: str,
+    *,
+    authors: str = "Test Author",
+    summary: str | None = None,
+) -> feedparser.FeedParserDict:
+    summary = summary or (
+        f"arXiv:{pid} Announce Type: new  Abstract: Abstract for {pid}"
+    )
+    base_id = pid.rsplit("v", 1)[0] if pid.rsplit("v", 1)[-1].isdigit() else pid
     return feedparser.FeedParserDict(
         id=f"oai:arXiv.org:{pid}",
         title=f"title {pid}",
+        summary=summary,
+        author=authors,
+        authors=[{"name": authors}],
+        links=[
+            {
+                "href": f"https://arxiv.org/abs/{base_id}",
+                "rel": "alternate",
+                "type": "text/html",
+            }
+        ],
         arxiv_announce_type="new",
     )
 
@@ -240,7 +259,8 @@ def test_retrieve_raw_papers_opens_circuit_after_batch_and_probe_406(
     retriever = ArxivRetriever(config)
     raw_papers = retriever._retrieve_raw_papers()
 
-    assert raw_papers == []
+    assert len(raw_papers) == 150
+    assert all(isinstance(p, arxiv_retriever.RssArxivResult) for p in raw_papers)
     assert len(call_id_lists) == 2
     assert len(call_id_lists[0]) == 20
     assert call_id_lists[1] == [paper_ids[0]]
@@ -273,7 +293,8 @@ def test_retrieve_raw_papers_opens_circuit_when_429_retries_exhausted(
     retriever = ArxivRetriever(config)
     raw_papers = retriever._retrieve_raw_papers()
 
-    assert raw_papers == []
+    assert len(raw_papers) == 40
+    assert all(isinstance(p, arxiv_retriever.RssArxivResult) for p in raw_papers)
     assert calls == arxiv_retriever.ARXIV_MAX_RETRIES
     assert slept == [30, 60]
 
@@ -306,9 +327,11 @@ def test_retrieve_raw_papers_discards_severely_degraded_results(
     retriever = ArxivRetriever(config)
     raw_papers = retriever._retrieve_raw_papers()
 
-    assert raw_papers == []
-    assert any("retrieved 3/150 papers" in msg for msg in warnings)
+    assert len(raw_papers) == 150
+    assert all(isinstance(p, arxiv_retriever.RssArxivResult) for p in raw_papers)
+    assert any("using RSS metadata fallback" in msg for msg in warnings)
     assert any("success_rate=2.0%" in msg for msg in infos)
+    assert any("ArXiv RSS fallback summary" in msg and "reconstructed=150" in msg for msg in infos)
 
 
 def test_retrieve_raw_papers_keeps_healthy_partial_results(
@@ -374,6 +397,73 @@ def test_retrieve_individual_nonretryable_error_skips_only_that_paper(
         f"https://arxiv.org/abs/{paper_ids[0]}",
         f"https://arxiv.org/abs/{paper_ids[2]}",
     ]
+
+
+def test_build_rss_fallback_papers_reconstructs_metadata(config):
+    retriever = ArxivRetriever(config)
+    entry = _make_feed_entry(
+        "2609.12345v1",
+        authors="Alice Example, Bob Researcher, Carol Physicist",
+        summary=(
+            "arXiv:2609.12345v1 Announce Type: new  Abstract: "
+            "A clean fallback abstract."
+        ),
+    )
+
+    papers = retriever._build_rss_fallback_papers([entry])
+
+    assert len(papers) == 1
+    paper = papers[0]
+    assert isinstance(paper, arxiv_retriever.RssArxivResult)
+    assert paper.title == "title 2609.12345v1"
+    assert [author.name for author in paper.authors] == [
+        "Alice Example",
+        "Bob Researcher",
+        "Carol Physicist",
+    ]
+    assert paper.summary == "A clean fallback abstract."
+    assert paper.entry_id == "https://arxiv.org/abs/2609.12345"
+    assert paper.pdf_url == "https://arxiv.org/pdf/2609.12345"
+    assert paper.source_url() == "https://arxiv.org/e-print/2609.12345"
+
+
+def test_build_rss_fallback_papers_skips_incomplete_entries(config, monkeypatch):
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        arxiv_retriever,
+        "logger",
+        SimpleNamespace(warning=warnings.append, info=lambda _: None),
+    )
+    retriever = ArxivRetriever(config)
+    entry = _make_feed_entry("2609.12345v1")
+    entry.summary = ""
+
+    papers = retriever._build_rss_fallback_papers([entry])
+
+    assert papers == []
+    assert any("Skipping incomplete arXiv RSS fallback entry" in msg for msg in warnings)
+
+
+def test_rss_fallback_converts_to_paper_without_api_result(config, monkeypatch):
+    retriever = ArxivRetriever(config)
+    entry = _make_feed_entry(
+        "2609.12345v1",
+        authors="Alice Example, Bob Researcher",
+    )
+    raw = retriever._build_rss_fallback_papers([entry])[0]
+
+    monkeypatch.setattr(arxiv_retriever, "extract_text_from_tar", lambda paper: "full text")
+    monkeypatch.setattr(arxiv_retriever, "extract_text_from_html", lambda paper: None)
+    monkeypatch.setattr(arxiv_retriever, "extract_text_from_pdf", lambda paper: None)
+
+    paper = retriever.convert_to_paper(raw)
+
+    assert paper.title == "title 2609.12345v1"
+    assert paper.authors == ["Alice Example", "Bob Researcher"]
+    assert paper.abstract == "Abstract for 2609.12345v1"
+    assert paper.url == "https://arxiv.org/abs/2609.12345"
+    assert paper.pdf_url == "https://arxiv.org/pdf/2609.12345"
+    assert paper.full_text == "full text"
 
 
 def test_run_with_hard_timeout_returns_value():
