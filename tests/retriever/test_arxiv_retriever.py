@@ -435,7 +435,7 @@ def test_build_rss_fallback_papers_skips_incomplete_entries(config, monkeypatch)
     )
     retriever = ArxivRetriever(config)
     entry = _make_feed_entry("2609.12345v1")
-    entry.summary = ""
+    entry["summary"] = ""
 
     papers = retriever._build_rss_fallback_papers([entry])
 
