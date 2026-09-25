@@ -1,0 +1,216 @@
+name: Diagnose metadata fallback coverage
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - diagnose/arxiv-406
+    paths:
+      - .github/workflows/diagnose-metadata-fallback.yml
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install diagnostic dependencies
+        run: python -m pip install --quiet requests feedparser
+
+      - name: Compare fallback metadata sources
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: |
+          python - <<'PY'
+          import json
+          import re
+          import time
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          from urllib.parse import quote
+
+          import feedparser
+          import requests
+
+          CATEGORIES = [
+              "cond-mat.dis-nn",
+              "cond-mat.mes-hall",
+              "cond-mat.mtrl-sci",
+              "cond-mat.other",
+              "cond-mat.quant-gas",
+              "cond-mat.stat-mech",
+              "cond-mat.str-el",
+              "cond-mat.supr-con",
+              "quant-ph",
+          ]
+          UA = "zotero-arxiv-daily-fallback-diagnostic/1.0 (+https://github.com/aft24590/zotero-arxiv-daily)"
+          SESSION = requests.Session()
+          SESSION.headers.update({"User-Agent": UA})
+
+          def base_id(pid):
+              return re.sub(r"v\d+$", "", pid)
+
+          query = "+".join(CATEGORIES)
+          rss_url = f"https://rss.arxiv.org/atom/{query}"
+          feed = feedparser.parse(rss_url)
+          entries = [
+              e for e in feed.entries
+              if e.get("arxiv_announce_type", "new") == "new"
+          ]
+          ids = [e.id.removeprefix("oai:arXiv.org:") for e in entries]
+          base_ids = [base_id(x) for x in ids]
+
+          print("=== RSS SOURCE ===")
+          print("rss_url:", rss_url)
+          print("candidate_count:", len(ids))
+          print("feed_bozo:", bool(feed.bozo))
+          print("title_count:", sum(bool(e.get("title")) for e in entries))
+          print("summary_count:", sum(bool(e.get("summary")) for e in entries))
+          print("authors_count:", sum(bool(e.get("authors")) for e in entries))
+          print("author_string_count:", sum(bool(e.get("author")) for e in entries))
+          print("links_count:", sum(bool(e.get("links")) for e in entries))
+          print("tags_count:", sum(bool(e.get("tags")) for e in entries))
+          if entries:
+              e = entries[0]
+              print("sample_id:", ids[0])
+              print("sample_keys:", sorted(e.keys()))
+              print("sample_title:", e.get("title"))
+              print("sample_summary_prefix:", (e.get("summary") or "")[:500].replace("\n", " "))
+              print("sample_authors:", e.get("authors"))
+              print("sample_author:", e.get("author"))
+              print("sample_links:", e.get("links"))
+              print("sample_tags:", e.get("tags"))
+
+          # Verify whether the legacy arXiv API is still failing from this runner.
+          if ids:
+              api_url = "https://export.arxiv.org/api/query"
+              started = time.monotonic()
+              resp = SESSION.get(
+                  api_url,
+                  params={
+                      "search_query": "",
+                      "id_list": ids[0],
+                      "sortBy": "relevance",
+                      "sortOrder": "descending",
+                      "start": 0,
+                      "max_results": 100,
+                  },
+                  timeout=30,
+              )
+              print("\n=== ARXIV API CONTROL ===")
+              print("paper_id:", ids[0])
+              print("status:", resp.status_code)
+              print("elapsed_seconds:", round(time.monotonic() - started, 3))
+              print("body_prefix:", (resp.text or "")[:250].replace("\n", " "))
+
+          # Semantic Scholar: one batch request for all current arXiv IDs.
+          print("\n=== SEMANTIC SCHOLAR ===")
+          s2_url = "https://api.semanticscholar.org/graph/v1/paper/batch"
+          started = time.monotonic()
+          try:
+              resp = SESSION.post(
+                  s2_url,
+                  params={
+                      "fields": "title,abstract,authors,externalIds,url,openAccessPdf,publicationDate"
+                  },
+                  json={"ids": [f"ARXIV:{x}" for x in base_ids]},
+                  timeout=60,
+              )
+              print("status:", resp.status_code)
+              print("elapsed_seconds:", round(time.monotonic() - started, 3))
+              print("body_prefix:", (resp.text or "")[:300].replace("\n", " "))
+              if resp.ok:
+                  data = resp.json()
+                  found = [x for x in data if x]
+                  print("requested:", len(base_ids))
+                  print("found:", len(found))
+                  print("coverage:", f"{len(found) / max(1, len(base_ids)):.1%}")
+                  print("title_count:", sum(bool(x.get("title")) for x in found))
+                  print("abstract_count:", sum(bool(x.get("abstract")) for x in found))
+                  print("authors_count:", sum(bool(x.get("authors")) for x in found))
+                  print("arxiv_external_id_count:", sum(bool((x.get("externalIds") or {}).get("ArXiv")) for x in found))
+                  if found:
+                      sample = found[0]
+                      print("sample:", json.dumps(sample, ensure_ascii=False)[:1200])
+          except Exception as exc:
+              print("exception:", type(exc).__name__, repr(exc))
+
+          # OpenAlex: resolve arXiv OAI location -> work. Singleton lookups are used
+          # because current OpenAlex work IDs do not expose arXiv in the work.ids object.
+          print("\n=== OPENALEX ===")
+
+          def fetch_openalex(pid):
+              bid = base_id(pid)
+              location_id = f"pmh:oai:arXiv.org:{bid}"
+              loc_url = "https://api.openalex.org/locations/" + quote(location_id, safe=":")
+              try:
+                  loc_resp = SESSION.get(loc_url, timeout=30)
+                  if loc_resp.status_code != 200:
+                      return {
+                          "pid": pid,
+                          "location_status": loc_resp.status_code,
+                          "work": None,
+                      }
+                  loc = loc_resp.json()
+                  work_id = loc.get("work_id")
+                  if not work_id:
+                      return {
+                          "pid": pid,
+                          "location_status": 200,
+                          "work": None,
+                      }
+                  work_url = "https://api.openalex.org/works/" + work_id.rsplit("/", 1)[-1]
+                  work_resp = SESSION.get(work_url, timeout=30)
+                  if work_resp.status_code != 200:
+                      return {
+                          "pid": pid,
+                          "location_status": 200,
+                          "work_status": work_resp.status_code,
+                          "work": None,
+                      }
+                  return {
+                      "pid": pid,
+                      "location_status": 200,
+                      "work_status": 200,
+                      "work": work_resp.json(),
+                  }
+              except Exception as exc:
+                  return {
+                      "pid": pid,
+                      "exception": f"{type(exc).__name__}: {exc}",
+                      "work": None,
+                  }
+
+          started = time.monotonic()
+          oa_results = []
+          with ThreadPoolExecutor(max_workers=12) as pool:
+              futures = [pool.submit(fetch_openalex, pid) for pid in ids]
+              for future in as_completed(futures):
+                  oa_results.append(future.result())
+
+          found = [r for r in oa_results if r.get("work")]
+          not_found = [r for r in oa_results if not r.get("work")]
+          print("requested:", len(ids))
+          print("found:", len(found))
+          print("coverage:", f"{len(found) / max(1, len(ids)):.1%}")
+          print("elapsed_seconds:", round(time.monotonic() - started, 3))
+          print("location_status_counts:", {
+              str(code): sum(r.get("location_status") == code for r in oa_results)
+              for code in sorted({r.get("location_status") for r in oa_results if r.get("location_status") is not None})
+          })
+          if found:
+              works = [r["work"] for r in found]
+              print("title_count:", sum(bool(w.get("title")) for w in works))
+              print("abstract_index_count:", sum(bool(w.get("abstract_inverted_index")) for w in works))
+              print("authors_count:", sum(bool(w.get("authorships")) for w in works))
+              print("sample_pid:", found[0]["pid"])
+              print("sample_work:", json.dumps(found[0]["work"], ensure_ascii=False)[:1600])
+          if not_found:
+              print("not_found_sample:", json.dumps(not_found[:10], ensure_ascii=False)[:1600])
+          PY
