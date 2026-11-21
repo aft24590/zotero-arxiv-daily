@@ -1,0 +1,13 @@
+name: Schedule Diagnostic
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '13,43 * * * *'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - run: date -u
