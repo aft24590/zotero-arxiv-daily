@@ -12,6 +12,9 @@ import re
 from queue import Empty
 from dataclasses import dataclass
 from time import monotonic, sleep
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+from ..arxiv_state import load_state, paper_id
 from typing import Any, Callable, TypeVar
 from loguru import logger
 import requests
@@ -51,7 +54,7 @@ class ArxivRetrievalStats:
     @property
     def success_rate(self) -> float:
         if self.candidates == 0:
-            return 1.0
+            return 0.0
         return self.retrieved / self.candidates
 
 
@@ -173,6 +176,68 @@ class ArxivRetriever(BaseRetriever):
         if self.config.source.arxiv.category is None:
             raise ValueError("category must be specified for arxiv.")
 
+    def _recover_empty_feed(self, client: arxiv.Client, seen: set[str]) -> list[ArxivResult]:
+        """Bounded API recovery for an empty weekday RSS, never silently succeed."""
+        now = datetime.now(timezone.utc)
+        eastern = now.astimezone(ZoneInfo("America/New_York"))
+        backfill_days = int(os.environ.get("ARXIV_BACKFILL_DAYS", "0"))
+        if not 0 <= backfill_days <= 14:
+            raise ValueError("ARXIV_BACKFILL_DAYS must be between 0 and 14")
+        if eastern.weekday() >= 5 and not backfill_days:
+            logger.info("Empty arXiv RSS on US Eastern weekend; no announcement expected")
+            return []
+        _, completed = load_state()
+        window_days = max(3, backfill_days)
+        if completed is not None:
+            elapsed = (now - completed).total_seconds() / 86400
+            if elapsed > 14:
+                raise RuntimeError(
+                    f"arXiv checkpoint is {elapsed:.1f} days old: "
+                    "manual backfill required before advancing state"
+                )
+            window_days = max(window_days, min(14, int(elapsed) + 2))
+        start = now - timedelta(days=window_days)
+        start_date = start.strftime("%Y%m%d%H%M")
+        end_date = now.strftime("%Y%m%d%H%M")
+        categories = " OR ".join(f"cat:{c}" for c in self.config.source.arxiv.category)
+        query = f"({categories}) AND submittedDate:[{start_date} TO {end_date}]"
+        logger.warning(
+            "RSS_EMPTY_RECOVERY: querying arXiv API for previous "
+            f"{window_days} days; date_range={start_date}..{end_date}"
+        )
+        limit = 500
+        search = arxiv.Search(
+            query=query, max_results=limit,
+            sort_by=arxiv.SortCriterion.SubmittedDate,
+            sort_order=arxiv.SortOrder.Descending,
+        )
+        for attempt in range(ARXIV_MAX_RETRIES):
+            try:
+                results = list(client.results(search))
+                if len(results) >= limit:
+                    raise RuntimeError(
+                        f"arXiv recovery returned >= {limit} entries: "
+                        "incomplete date-window coverage, do not advance checkpoint"
+                    )
+                unique = {}
+                for result in results:
+                    identifier = paper_id(result.entry_id)
+                    if identifier not in seen:
+                        unique.setdefault(identifier, result)
+                logger.warning(
+                    f"RSS_EMPTY_RECOVERY: api_results={len(results)}, "
+                    f"unseen={len(unique)}, seen={len(seen)}"
+                )
+                if not results and eastern.weekday() < 5:
+                    raise RuntimeError("arXiv recovery API also returned zero results on a weekday")
+                return list(unique.values())
+            except arxiv.HTTPError as exc:
+                logger.warning(f"arXiv recovery attempt {attempt+1} failed: {exc}")
+                if attempt + 1 == ARXIV_MAX_RETRIES:
+                    raise RuntimeError("arXiv recovery exhausted API retries") from exc
+                sleep(ARXIV_RETRY_DELAY_SECONDS * (attempt + 1))
+        raise RuntimeError("arXiv RSS recovery failed")
+
     def _retrieve_raw_papers(self) -> list[ArxivResult | RssArxivResult]:
         started = monotonic()
         client = arxiv.Client(
@@ -182,23 +247,45 @@ class ArxivRetriever(BaseRetriever):
         query = '+'.join(self.config.source.arxiv.category)
         include_cross_list = self.config.source.arxiv.get("include_cross_list", False)
 
-        feed = feedparser.parse(f"https://rss.arxiv.org/atom/{query}")
-        if 'Feed error for query' in feed.feed.title:
-            raise Exception(f"Invalid ARXIV_QUERY: {query}.")
+        url = f"https://rss.arxiv.org/atom/{query}"
+        feed = feedparser.parse(url)
+        title = feed.get("feed", {}).get("title", "")
+        entries = feed.get("entries", [])
+        counts = {}
+        for entry in entries:
+            kind = entry.get("arxiv_announce_type", "new")
+            counts[kind] = counts.get(kind, 0) + 1
+        logger.info(
+            f"arXiv RSS diagnostics: url={url}, status={feed.get('status')}, "
+            f"bozo={bool(feed.get('bozo'))}, updated={feed.get('feed', {}).get('updated')}, "
+            f"total={len(entries)}, announcement_counts={counts}"
+        )
+        if "Feed error for query" in title:
+            raise RuntimeError(f"Invalid ARXIV_QUERY: {query}")
+        if feed.get("bozo") and not entries:
+            raise RuntimeError(f"arXiv RSS parse failed: {feed.get('bozo_exception')}")
+        if feed.get("status") not in (None, 200, 304):
+            raise RuntimeError(f"arXiv RSS HTTP status={feed.get('status')}")
 
         allowed_announce_types = {"new", "cross"} if include_cross_list else {"new"}
+        seen, _ = load_state()
         selected_entries = [
-            entry
-            for entry in feed.entries
+            entry for entry in entries
             if entry.get("arxiv_announce_type", "new") in allowed_announce_types
+            and paper_id(entry.id) not in seen
         ]
         if self.config.executor.debug:
             selected_entries = selected_entries[:10]
 
-        all_paper_ids = [
-            entry.id.removeprefix("oai:arXiv.org:")
-            for entry in selected_entries
-        ]
+        all_paper_ids = [entry.id.removeprefix("oai:arXiv.org:") for entry in selected_entries]
+        logger.info(
+            f"arXiv RSS candidates: total={len(entries)}, eligible_unseen={len(all_paper_ids)}, "
+            f"already_seen_or_excluded={len(entries)-len(all_paper_ids)}"
+        )
+        if not entries:
+            return self._recover_empty_feed(client, seen)
+        if not selected_entries:
+            return []
 
         stats = ArxivRetrievalStats(candidates=len(all_paper_ids))
         raw_papers: list[ArxivResult] = []
