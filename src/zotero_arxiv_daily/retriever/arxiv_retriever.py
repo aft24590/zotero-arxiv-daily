@@ -250,7 +250,7 @@ class ArxivRetriever(BaseRetriever):
         url = f"https://rss.arxiv.org/atom/{query}"
         feed = feedparser.parse(url)
         title = feed.get("feed", {}).get("title", "")
-        entries = feed.get("entries", [])
+        entries = feed.entries
         counts = {}
         for entry in entries:
             kind = entry.get("arxiv_announce_type", "new")
