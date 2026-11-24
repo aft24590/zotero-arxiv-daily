@@ -187,7 +187,7 @@ class ArxivRetriever(BaseRetriever):
             logger.info("Empty arXiv RSS on US Eastern weekend; no announcement expected")
             return []
         _, completed = load_state()
-        window_days = max(3, backfill_days)
+        window_days = max(2, backfill_days)
         if completed is not None:
             elapsed = (now - completed).total_seconds() / 86400
             if elapsed > 14:
@@ -205,7 +205,7 @@ class ArxivRetriever(BaseRetriever):
             "RSS_EMPTY_RECOVERY: querying arXiv API for previous "
             f"{window_days} days; date_range={start_date}..{end_date}"
         )
-        limit = 500
+        limit = 2000
         search = arxiv.Search(
             query=query, max_results=limit,
             sort_by=arxiv.SortCriterion.SubmittedDate,
