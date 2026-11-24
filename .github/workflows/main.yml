@@ -14,6 +14,14 @@ jobs:
       - name: Setup uv
         uses: astral-sh/setup-uv@v7
 
+      - name: Restore arXiv checkpoint
+        uses: actions/cache/restore@v4
+        with:
+          path: .arxiv-state.json
+          key: arxiv-seen-${{ github.run_id }}
+          restore-keys: |
+            arxiv-seen-
+
       - name: Run script
         env:
           ZOTERO_ID: ${{ secrets.ZOTERO_ID }}
@@ -24,8 +32,15 @@ jobs:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OPENAI_API_BASE: ${{ secrets.OPENAI_API_BASE }}
           CUSTOM_CONFIG: ${{ vars.CUSTOM_CONFIG }}
+          ARXIV_STATE_PATH: .arxiv-state.json
         run: |
           printf "%b\n" "$CUSTOM_CONFIG" > config/custom.yaml
           echo "Use custom config: "
           cat config/custom.yaml
           uv run src/zotero_arxiv_daily/main.py
+
+      - name: Save arXiv checkpoint
+        uses: actions/cache/save@v4
+        with:
+          path: .arxiv-state.json
+          key: arxiv-seen-${{ github.run_id }}
